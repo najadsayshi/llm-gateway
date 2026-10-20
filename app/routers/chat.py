@@ -3,7 +3,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from app.providers.openai_client import chat_completion, open_chat_stream
+from app.providers.compatible import chat_completion, open_chat_stream
+from app.providers.registry import provider_for_model
 from app.schemas import ChatCompletionRequest
 
 router = APIRouter()
@@ -11,7 +12,24 @@ router = APIRouter()
 
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
-    client = request.app.state.client
+    provider = provider_for_model(body.model)
+
+    if provider is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": f"Unknown model: {body.model}",
+                               "type": "model_not_found", "param": "model"}},
+        )
+
+    client = request.app.state.clients.get(provider.name)
+
+    if client is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": f"Provider '{provider.name}' is not configured",
+                               "type": "provider_unavailable"}},
+        )
+
     payload = body.model_dump(exclude_none=True)
 
     try:
@@ -40,10 +58,12 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     except httpx.TimeoutException:
         return JSONResponse(
             status_code=504,
-            content={"error": {"message": "Upstream provider timed out", "type": "gateway_timeout"}},
+            content={"error": {"message": "Upstream provider timed out",
+                               "type": "gateway_timeout"}},
         )
     except httpx.RequestError:
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": "Could not reach upstream provider", "type": "bad_gateway"}},
+            content={"error": {"message": "Could not reach upstream provider",
+                               "type": "bad_gateway"}},
         )

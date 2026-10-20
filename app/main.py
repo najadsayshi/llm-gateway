@@ -1,34 +1,40 @@
-from fastapi import FastAPI
 from contextlib import asynccontextmanager
+
 import httpx
+from fastapi import FastAPI
+
 from app.config import settings
+from app.providers.registry import PROVIDERS
 from app.routers.chat import router as chat_router
-
-
-
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    clients = {}
 
-    client =  httpx.AsyncClient(
-        base_url= settings.openai_api_base,
-        headers = {"Authorization": f"Bearer {settings.openai_api_key}"},
-        timeout=httpx.Timeout(settings.request_timeout, connect=5.0),
+    for provider in PROVIDERS:
+        if not provider.api_key:
+            continue
 
+        clients[provider.name] = httpx.AsyncClient(
+            base_url=provider.base_url,
+            headers={"Authorization": f"Bearer {provider.api_key}"},
+            timeout=httpx.Timeout(settings.request_timeout, connect=5.0),
+        )
 
-    ) 
-    app.state.client=client
+    app.state.clients = clients
 
     yield
 
-    await client.aclose()
+    for client in clients.values():
+        await client.aclose()
 
-app = FastAPI(title="LLM Gateway",
-              lifespan=lifespan,)
+
+app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 
 app.include_router(chat_router)
 
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "providers": sorted(app.state.clients)}

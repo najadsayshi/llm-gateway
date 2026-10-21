@@ -1,3 +1,5 @@
+from urllib import response
+
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -8,7 +10,18 @@ from app.providers.registry import provider_for_model
 from app.schemas import ChatCompletionRequest
 
 router = APIRouter()
-
+#helper function 
+def parse_response(response: httpx.Response) -> dict:
+    try:
+        data = response.json()
+        if isinstance(data,dict):
+            return data
+        return {"error": {"message": "Invalid JSON response from upstream provider",
+                                            "type": "invalid_response"}}
+    
+    except ValueError:
+        return {"error": {"message": "Invalid JSON response from upstream provider",
+                            "type": "invalid_response"}}
 
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
@@ -38,7 +51,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
             if upstream.status_code >= 400:
                 await upstream.aread()
-                error = upstream.json()
+                error = parse_response(upstream)
                 await upstream.aclose()
                 return JSONResponse(status_code=upstream.status_code, content=error)
 
@@ -49,11 +62,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             )
 
         response = await chat_completion(client, payload)
-
+        
+        response_data = parse_response(response)
         if response.status_code >= 400:
-            return JSONResponse(status_code=response.status_code, content=response.json())
+            return JSONResponse(status_code=response.status_code, content= response_data)
 
-        return response.json()
+        return response_data
+
+            
+        
+
 
     except httpx.TimeoutException:
         return JSONResponse(

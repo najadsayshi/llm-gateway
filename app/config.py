@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
 
+    #POSTGRESQL DATABASE URL
+    database_url : str
+    
+
     request_timeout: float = 60.0
 
     model_config = SettingsConfigDict(env_file=".env")

@@ -35,6 +35,10 @@ app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 app.include_router(chat_router)
 
 
+@app.get("/")
+async def root():
+    return {"message": "Welcome to LLM Gateway!, My babesssssss"}
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "providers": sorted(app.state.clients)}

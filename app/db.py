@@ -14,6 +14,13 @@ AsyncSessionLocal = async_sessionmaker( #creating session maker
 
 
 
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
+
+
 
 class Base(DeclarativeBase): # creating base class for models
     pass

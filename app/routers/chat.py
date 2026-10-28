@@ -9,6 +9,11 @@ from app.providers.compatible import chat_completion, open_chat_stream
 from app.providers.registry import provider_for_model
 from app.schemas import ChatCompletionRequest
 
+from fastapi import Depends
+from app.auth import get_api_key
+from app.models import APIKey
+
+
 router = APIRouter()
 #helper function 
 def parse_response(response: httpx.Response) -> dict:
@@ -24,7 +29,8 @@ def parse_response(response: httpx.Response) -> dict:
                             "type": "invalid_response"}}
 
 @router.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest, request: Request):
+async def chat_completions(body: ChatCompletionRequest, request: Request,
+                           api_key: APIKey = Depends(get_api_key)):
     provider = provider_for_model(body.model)
 
     if provider is None:

@@ -12,6 +12,7 @@ from app.schemas import ChatCompletionRequest
 from fastapi import Depends
 from app.auth import get_api_key
 from app.models import APIKey
+from app.rate_limit import enforce_rate_limit
 
 
 router = APIRouter()
@@ -30,7 +31,7 @@ def parse_response(response: httpx.Response) -> dict:
 
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request,
-                           api_key: APIKey = Depends(get_api_key)):
+                           api_key: APIKey = Depends(enforce_rate_limit)):
     provider = provider_for_model(body.model)
 
     if provider is None:

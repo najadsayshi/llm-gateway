@@ -13,3 +13,5 @@ class APIKey(Base):
     name : Mapped[str] = mapped_column()
     is_active : Mapped[bool] = mapped_column(default = True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    rate_limit : Mapped[int] = mapped_column(default = 60)
+    

@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
-
+import redis.asyncio as redis
 from app.config import settings
 from app.providers.registry import PROVIDERS
 from app.routers.chat import router as chat_router
@@ -23,11 +23,14 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.clients = clients
+    app.state.redis = redis.from_url(settings.redis_url)
+
 
     yield
 
     for client in clients.values():
         await client.aclose()
+    await app.state.redis.aclose()
 
 
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)

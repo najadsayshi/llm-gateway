@@ -1,8 +1,8 @@
 from app.db import Base
 from sqlalchemy.orm import mapped_column, Mapped
 from datetime import datetime
-from sqlalchemy import func, ForeignKey, Numeric
 from decimal import Decimal
+from sqlalchemy import func, ForeignKey, Numeric, DateTime
 
 class APIKey(Base):
     __tablename__ = "api_keys"
@@ -12,7 +12,8 @@ class APIKey(Base):
     key_prefix : Mapped[str] = mapped_column()
     name : Mapped[str] = mapped_column()
     is_active : Mapped[bool] = mapped_column(default = True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
     rate_limit : Mapped[int] = mapped_column(default = 60)
 
 class UsageRecord(Base):
@@ -25,6 +26,7 @@ class UsageRecord(Base):
     prompt_tokens : Mapped[int] = mapped_column()
     completion_tokens : Mapped[int] = mapped_column()
     total_tokens : Mapped[int] = mapped_column()
-    cost : Mapped[Decimal] = mapped_column(Numeric(12,6))
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    cost: Mapped[Decimal] = mapped_column(Numeric(18, 12))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 

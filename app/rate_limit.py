@@ -6,20 +6,18 @@ import time
 
 async def check_rate_limit(redis_client, key_id: int, limit: int) -> int | None:
     """Return None if the request is allowed, or seconds-to-wait if not."""
-
     window = int(time.time() // 60)  # Current minute window
 
     redis_key = f"rate_limit:{key_id}:{window}"
 
-    count = await redis_client.incr(redis_key)
+    pipe = redis_client.pipeline()
+    pipe.incr(redis_key)
+    pipe.expire(redis_key, 60)
+    count, _ = await pipe.execute()
 
-    if count == 1:
-        await redis_client.expire(redis_key, 60)
     if count > limit:
         return 60 - int(time.time()) % 60
     return None
-
-
 
 async def enforce_rate_limit(request: Request,api_key: APIKey = Depends(get_api_key),) -> APIKey:
     redis_client = request.app.state.redis

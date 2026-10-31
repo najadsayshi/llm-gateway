@@ -4,10 +4,12 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
-
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db import get_session
 from app.providers.compatible import chat_completion, open_chat_stream
 from app.providers.registry import provider_for_model
 from app.schemas import ChatCompletionRequest
+from app.usage import record_usage
 
 from fastapi import Depends
 from app.auth import get_api_key
@@ -31,7 +33,8 @@ def parse_response(response: httpx.Response) -> dict:
 
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request,
-                           api_key: APIKey = Depends(enforce_rate_limit)):
+                           api_key: APIKey = Depends(enforce_rate_limit),
+                           session : AsyncSession = Depends(get_session)):
     provider = provider_for_model(body.model)
 
     if provider is None:
@@ -74,6 +77,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
         if response.status_code >= 400:
             return JSONResponse(status_code=response.status_code, content= response_data)
 
+        await record_usage(session=session,api_key_id=api_key.id,model=body.model,provider=provider.name,
+                           usage=response_data.get("usage") or {},
+                )
+
+
         return response_data
 
             
@@ -92,3 +100,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
             content={"error": {"message": "Could not reach upstream provider",
                                "type": "bad_gateway"}},
         )
+
+
+

@@ -1,20 +1,20 @@
 # LLM Gateway
 
-An OpenAI-compatible API gateway that authenticates callers and routes chat requests to multiple
-LLM providers.
+An OpenAI-compatible API gateway that authenticates callers, enforces per-key rate limits, and
+routes chat requests to multiple LLM providers.
 
 Point any OpenAI client at this server instead of `api.openai.com` and it keeps working — the
 request and response formats are identical. Callers authenticate with a key the gateway issues;
 provider credentials stay server-side and are never exposed.
 
 ```
-                  ┌──────────────────────────┐
-  client ────────▶│        GATEWAY           │────▶ OpenAI
-  (gateway key)   │                          │────▶ Groq
-                  │  auth · routing · errors │────▶ OpenRouter
-                  └──────────────────────────┘
-                              │
-                        Postgres (keys)
+                  ┌───────────────────────────────────┐
+  client ────────▶│              GATEWAY              │────▶ OpenAI
+  (gateway key)   │                                   │────▶ Groq
+                  │  auth · limits · routing · errors │────▶ OpenRouter
+                  └───────────────────────────────────┘
+                          │                   │
+                   Postgres (keys)     Redis (counters)
 ```
 
 ## What it does
@@ -23,6 +23,8 @@ provider credentials stay server-side and are never exposed.
   `openai/gpt-oss-20b` goes to Groq.
 - **API key authentication.** Every request needs a gateway-issued key. Keys are stored as SHA-256
   hashes, never in plain text, and can be revoked without a redeploy.
+- **Per-key rate limiting.** Each key carries its own requests-per-minute limit, counted in Redis.
+  Exceeding it returns `429` with a `Retry-After` header.
 - **Provider credentials stay server-side.** Clients never hold an OpenAI or Groq key.
 - **Streaming.** `"stream": true` relays Server-Sent Events, resolving the upstream status before
   response headers are committed.
@@ -56,8 +58,12 @@ python -m scripts.create_key "my laptop"    # prints a key — copy it, it is sh
 uvicorn app.main:app --reload
 ```
 
-`OPENAI_API_KEY` and `DATABASE_URL` are required. Providers without a key are skipped at startup;
-`GET /health` lists the ones that came up.
+`OPENAI_API_KEY`, `DATABASE_URL` and `REDIS_URL` are required. Providers without a key are skipped
+at startup; `GET /health` lists the ones that came up.
+
+Configuration is strict in both directions: a variable in `.env` with no matching field in
+`Settings` aborts startup, and so does a field with no default and no variable. Config errors
+surface at boot rather than as a surprising `None` later.
 
 ### Database
 
@@ -71,6 +77,18 @@ DATABASE_URL=postgresql+asyncpg://user:pass@host-pooler.region.aws.neon.tech/dbn
 Two details matter. The scheme must be `postgresql+asyncpg` so SQLAlchemy loads the async driver,
 and any `?sslmode=...&channel_binding=...` query string must be removed — those are libpq options
 that `asyncpg` does not accept. SSL is configured in `app/db.py` instead.
+
+### Redis
+
+Any Redis instance works. [Upstash](https://upstash.com) has a free tier and needs no local setup.
+
+```
+REDIS_URL=rediss://default:your-token@your-db.upstash.io:6379
+```
+
+Use the connection string from the **redis-cli** tab, not the REST credentials — those are a
+separate HTTP API meant for environments that cannot hold a socket open. The scheme must be
+`rediss://` with two `s`, which is where TLS is declared; `redis://` will be refused.
 
 ## Usage
 
@@ -104,6 +122,7 @@ gateway's own.
 | `401` | Missing, unknown or revoked API key |
 | `404` | The requested model is not in the registry — no upstream call is made |
 | `422` | Request body failed validation |
+| `429` | The key's per-minute limit is exhausted — carries a `Retry-After` header |
 | `502` | The provider could not be reached (DNS or connection failure) |
 | `503` | The model's provider has no API key configured |
 | `504` | The provider accepted the request but did not respond in time |
@@ -125,6 +144,44 @@ a deterministic hash makes it a single indexed lookup.
 Revoke a key by setting `is_active` to false. The next request using it fails, with no restart
 needed.
 
+## How rate limiting works
+
+Each row in `api_keys` carries its own `rate_limit` — requests allowed per minute, defaulting to
+60. Changing a key's limit is an `UPDATE`, not a redeploy.
+
+Counting uses a **fixed window** in Redis. The key name contains the window it belongs to:
+
+```
+rate_limit:{key_id}:{minute}        minute = int(time.time() // 60)
+```
+
+Each request issues `INCR` and `EXPIRE` in a single pipelined round trip. `INCR` creates the key
+at 1 if absent and returns the new count; if that count exceeds the limit, the request is rejected
+with `429` and a `Retry-After` giving the seconds left in the window.
+
+Three decisions worth naming:
+
+**`INCR` rather than read-modify-write.** Incrementing is a single atomic operation, so concurrent
+requests cannot both read the same count and both write back the same value. That race is what
+makes a naive limiter leak through, and avoiding it requires no locking code here.
+
+**The window number is in the key name.** It makes the count reset for free — a new minute means a
+new key — and it bounds the blast radius of a partial failure. If the process dies between `INCR`
+and `EXPIRE`, the key survives without a TTL; a constant key name would lock that caller out
+permanently, whereas a per-minute name expires the problem within 60 seconds. It is also what lets
+`EXPIRE` run unconditionally on every request, since the deadline it sets never moves outside the
+minute the key already belongs to.
+
+**Redis rather than process memory.** A dict in the process would be lost on restart and, more
+importantly, would not be shared — two instances behind a load balancer would each allow the full
+limit. Counters belong outside the process for the same reason sessions do.
+
+The tradeoff of a fixed window is burst tolerance at the boundary: a caller can spend a full limit
+at `10:00:59` and another at `10:01:00`, so the true worst case is 2× the limit over a short
+interval. A sliding window (a Redis sorted set of timestamps) or a token bucket removes this at the
+cost of more memory and more code. For a gateway, 2× tolerance is an acceptable price for an O(1),
+two-command check.
+
 ## Adding a provider
 
 Any OpenAI-compatible provider is a few lines of data. Add its base URL and key to
@@ -140,6 +197,7 @@ app/
   schemas.py                request validation
   auth.py                   API key verification, used as a FastAPI dependency
   security.py               key generation and hashing
+  rate_limit.py             fixed-window counter and the enforcing dependency
   db.py                     async engine, session factory, declarative base
   models.py                 the api_keys table
   routers/chat.py           the endpoint, routing and error policy
@@ -152,10 +210,17 @@ scripts/
 
 ## Status
 
-Working: API key authentication, multi-provider routing, streaming, error mapping.
+Working: API key authentication, per-key rate limiting, multi-provider routing, streaming, error
+mapping.
 
-Planned: per-key rate limiting, usage and cost tracking, response caching, retries and provider
-failover, tests and Docker.
+Planned: usage and cost tracking, response caching, retries and provider failover, tests and
+Docker.
 
 Schema changes are applied with `scripts/init_db.py`, which only creates missing tables and never
-alters existing ones. A migration tool will be needed once columns start changing.
+alters existing ones — the `rate_limit` column was added to an existing database by hand with
+`ALTER TABLE`. That works for one developer and one database, and stops working the moment there
+is a second of either, because nothing records that the change happened. Alembic is the next thing
+this project needs.
+
+A stream that fails mid-flight cannot be recovered, since the `200` and the first bytes have
+already been sent. Retries and failover can only help before the response starts.

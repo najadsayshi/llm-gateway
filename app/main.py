@@ -6,7 +6,7 @@ import redis.asyncio as redis
 from app.config import settings
 from app.providers.registry import PROVIDERS
 from app.routers.chat import router as chat_router
-
+from app.routers.usage import router as usage_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 
 app.include_router(chat_router)
+app.include_router(usage_router)
 
 
 @app.get("/")

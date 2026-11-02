@@ -1,5 +1,3 @@
-from urllib import response
-
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -12,9 +10,12 @@ from app.schemas import ChatCompletionRequest
 from app.usage import record_usage
 
 from fastapi import Depends
-from app.auth import get_api_key
 from app.models import APIKey
 from app.rate_limit import enforce_rate_limit
+
+
+from app.cache import make_cache_key, get_cached_response, set_cached_response #for caching
+
 
 
 router = APIRouter()
@@ -55,6 +56,21 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
 
     payload = body.model_dump(exclude_none=True)
 
+    #caching key and redis client
+    cache_key = make_cache_key(payload)
+    redis_client = request.app.state.redis
+
+    try:
+
+        cached_response = await get_cached_response(redis_client,cache_key)
+    except Exception as e:
+        print(f"Error occurred while fetching cached response: {e}")
+        cached_response = None
+    if cached_response is  not None:
+        return JSONResponse(content=cached_response, headers={"X-Cache": "HIT"})
+
+
+
     try:
         if body.stream:
             upstream = await open_chat_stream(client, payload)
@@ -81,8 +97,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
                            usage=response_data.get("usage") or {},
                 )
 
+        try:
+            await set_cached_response(redis_client, cache_key, response_data)
 
-        return response_data
+        except Exception as e:
+            print(f"Error occurred while caching response: {e}")
+
+        return JSONResponse(content=response_data, headers={"X-Cache": "MISS"})
 
             
         

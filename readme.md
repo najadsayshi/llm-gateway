@@ -1,7 +1,7 @@
 # LLM Gateway
 
-An OpenAI-compatible API gateway that authenticates callers, enforces per-key rate limits, and
-routes chat requests to multiple LLM providers.
+An OpenAI-compatible API gateway that authenticates callers, enforces per-key rate limits, tracks
+token usage and cost, and routes chat requests to multiple LLM providers.
 
 Point any OpenAI client at this server instead of `api.openai.com` and it keeps working — the
 request and response formats are identical. Callers authenticate with a key the gateway issues;
@@ -11,10 +11,10 @@ provider credentials stay server-side and are never exposed.
                   ┌───────────────────────────────────┐
   client ────────▶│              GATEWAY              │────▶ OpenAI
   (gateway key)   │                                   │────▶ Groq
-                  │  auth · limits · routing · errors │────▶ OpenRouter
+                  │  auth · limits · usage · routing  │────▶ OpenRouter
                   └───────────────────────────────────┘
                           │                   │
-                   Postgres (keys)     Redis (counters)
+                 Postgres (keys, usage)  Redis (counters)
 ```
 
 ## What it does
@@ -25,6 +25,8 @@ provider credentials stay server-side and are never exposed.
   hashes, never in plain text, and can be revoked without a redeploy.
 - **Per-key rate limiting.** Each key carries its own requests-per-minute limit, counted in Redis.
   Exceeding it returns `429` with a `Retry-After` header.
+- **Usage and cost tracking.** Every completion is logged with its token counts and exact cost.
+  `GET /v1/usage` returns the calling key's totals, grouped by model.
 - **Provider credentials stay server-side.** Clients never hold an OpenAI or Groq key.
 - **Streaming.** `"stream": true` relays Server-Sent Events, resolving the upstream status before
   response headers are committed.
@@ -109,6 +111,7 @@ and the Try-it-out buttons will send it for you.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `POST` | `/v1/chat/completions` | required | OpenAI-compatible chat completions, streaming optional |
+| `GET` | `/v1/usage` | required | Token and cost totals for the calling key, grouped by model |
 | `GET` | `/health` | none | Liveness check plus the list of configured providers |
 | `GET` | `/` | none | Service name |
 
@@ -182,6 +185,75 @@ interval. A sliding window (a Redis sorted set of timestamps) or a token bucket 
 cost of more memory and more code. For a gateway, 2× tolerance is an acceptable price for an O(1),
 two-command check.
 
+## How usage tracking works
+
+Every successful completion writes a row to `usage_records`: the key that made it, the model and
+provider, three token counts, the computed cost, and a `timestamptz`. Prices live in
+`app/pricing.py` as a per-model `(input, output)` pair in USD per million tokens.
+
+```bash
+curl -s http://localhost:8000/v1/usage -H 'Authorization: Bearer gw_live_YOUR_KEY'
+```
+
+```json
+{
+  "data": [
+    {
+      "model": "gpt-4o-mini",
+      "requests": 2,
+      "prompt_tokens": 34,
+      "completion_tokens": 16,
+      "total_tokens": 50,
+      "cost": "0.000014700000"
+    }
+  ]
+}
+```
+
+Four decisions worth naming:
+
+**A log, not a counter.** One row per request rather than a running total per key. A log can always
+be aggregated; a total can never be taken apart again. "Which model did this key spend most on in
+October" is answerable from one and not the other. Aggregation happens in SQL via `GROUP BY`, so a
+summary moves one row per model rather than every row ever written.
+
+**Postgres here, Redis for rate limits.** Opposite choices in the same project, for opposite
+requirements. A rate-limit counter lives sixty seconds and nobody cares if it is lost on restart.
+Usage is money: it has to be durable and queryable, and losing it means it cannot be reconstructed.
+
+**`Numeric(18, 12)`, never a float.** Floats cannot represent most decimals exactly, and the error
+compounds across rows. Python's `Decimal` refuses arithmetic with `float` outright, which is how
+this class of bug gets caught at the boundary instead of in a billing report. The scale matters as
+much as the type: an earlier `Numeric(12, 6)` stored a real cost of `$0.00000735` as `$0.000007`,
+losing 4.8%, because per-request LLM costs sit right at the edge of six decimal places. Precision
+has to be chosen against the magnitude of the thing being measured.
+
+**Cost is serialised as a string.** JSON has no decimal type — only `number`, which is a float. A
+`Decimal` sent as a JSON number loses exactly the precision the column was widened to keep, so
+`GET /v1/usage` quotes it and the client parses it into whatever exact type it has. Payment APIs do
+the same thing for the same reason.
+
+Two smaller ones. The provider's reported `total_tokens` is stored rather than recomputed from the
+other two counts, because Groq's `gpt-oss` models bill reasoning tokens that appear in neither — so
+recomputing would under-report precisely what is charged for. And an unpriced model records a cost
+of zero with a warning rather than raising: the request already succeeded upstream, and failing to
+account for it does not un-spend the money.
+
+`GET /v1/usage` takes no key parameter. The key id comes from the `Authorization` header, so there
+is nothing for a caller to tamper with and no way to read another key's spend.
+
+### Not yet covered
+
+**Streamed requests are not billed.** SSE chunks carry no `usage` block unless the request sets
+`stream_options: {"include_usage": true}`, and the gateway currently relays bytes without
+inspecting them. Capturing the total would mean parsing the stream in flight. Tracked as a known
+gap rather than silently under-reporting.
+
+Writes happen inline, before the response returns, which adds a database round trip to every
+request. Moving it to a background task would remove that latency at the cost of losing records if
+the process dies in the window — the wrong trade for billing data, and not worth making until the
+latency is measured.
+
 ## Adding a provider
 
 Any OpenAI-compatible provider is a few lines of data. Add its base URL and key to
@@ -198,9 +270,12 @@ app/
   auth.py                   API key verification, used as a FastAPI dependency
   security.py               key generation and hashing
   rate_limit.py             fixed-window counter and the enforcing dependency
+  usage.py                  writes usage rows, aggregates them for the summary
+  pricing.py                per-model rates and cost calculation
   db.py                     async engine, session factory, declarative base
-  models.py                 the api_keys table
+  models.py                 the api_keys and usage_records tables
   routers/chat.py           the endpoint, routing and error policy
+  routers/usage.py          the usage summary endpoint
   providers/registry.py     which provider owns which models
   providers/compatible.py   the upstream call
 scripts/
@@ -210,17 +285,17 @@ scripts/
 
 ## Status
 
-Working: API key authentication, per-key rate limiting, multi-provider routing, streaming, error
-mapping.
+Working: API key authentication, per-key rate limiting, usage and cost tracking, multi-provider
+routing, streaming, error mapping.
 
-Planned: usage and cost tracking, response caching, retries and provider failover, tests and
-Docker.
+Planned: response caching, retries and provider failover, tests and Docker.
 
 Schema changes are applied with `scripts/init_db.py`, which only creates missing tables and never
-alters existing ones — the `rate_limit` column was added to an existing database by hand with
-`ALTER TABLE`. That works for one developer and one database, and stops working the moment there
-is a second of either, because nothing records that the change happened. Alembic is the next thing
-this project needs.
+alters existing ones — the `rate_limit` column, the `timestamptz` conversions and the widening of
+`cost` were all applied to an existing database by hand with `ALTER TABLE`, and the model had to be
+changed to match each time. That works for one developer and one database, and stops working the
+moment there is a second of either, because nothing records that the change happened. Alembic is
+the next thing this project needs.
 
 A stream that fails mid-flight cannot be recovered, since the `200` and the first bytes have
 already been sent. Retries and failover can only help before the response starts.

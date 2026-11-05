@@ -1,20 +1,21 @@
 # LLM Gateway
 
-An OpenAI-compatible API gateway that authenticates callers, enforces per-key rate limits, tracks
-token usage and cost, and routes chat requests to multiple LLM providers.
+An OpenAI-compatible API gateway that authenticates callers, enforces per-key rate limits, caches
+repeated completions, tracks token usage and cost, and routes chat requests to multiple LLM
+providers.
 
 Point any OpenAI client at this server instead of `api.openai.com` and it keeps working — the
 request and response formats are identical. Callers authenticate with a key the gateway issues;
 provider credentials stay server-side and are never exposed.
 
 ```
-                  ┌───────────────────────────────────┐
-  client ────────▶│              GATEWAY              │────▶ OpenAI
-  (gateway key)   │                                   │────▶ Groq
-                  │  auth · limits · usage · routing  │────▶ OpenRouter
-                  └───────────────────────────────────┘
-                          │                   │
-                 Postgres (keys, usage)  Redis (counters)
+                  ┌─────────────────────────────────────────┐
+  client ────────▶│                 GATEWAY                 │────▶ OpenAI
+  (gateway key)   │                                         │────▶ Groq
+                  │ auth · limits · cache · usage · routing │────▶ OpenRouter
+                  └─────────────────────────────────────────┘
+                            │                       │
+                 Postgres (keys, usage)  Redis (counters, cache)
 ```
 
 ## What it does
@@ -25,6 +26,8 @@ provider credentials stay server-side and are never exposed.
   hashes, never in plain text, and can be revoked without a redeploy.
 - **Per-key rate limiting.** Each key carries its own requests-per-minute limit, counted in Redis.
   Exceeding it returns `429` with a `Retry-After` header.
+- **Response caching.** Identical requests are served from Redis instead of the provider — 12.8x
+  faster and free. Every response carries `X-Cache: HIT` or `MISS`.
 - **Usage and cost tracking.** Every completion is logged with its token counts and exact cost.
   `GET /v1/usage` returns the calling key's totals, grouped by model.
 - **Provider credentials stay server-side.** Clients never hold an OpenAI or Groq key.
@@ -92,6 +95,9 @@ Use the connection string from the **redis-cli** tab, not the REST credentials �
 separate HTTP API meant for environments that cannot hold a socket open. The scheme must be
 `rediss://` with two `s`, which is where TLS is declared; `redis://` will be refused.
 
+One Redis serves both the rate-limit counters and the response cache. They are kept apart by key
+prefix — `rate_limit:` and `cache:` — since Redis has no namespaces of its own.
+
 ## Usage
 
 ```bash
@@ -102,6 +108,15 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 Add `"stream": true` for Server-Sent Events, and `-N` to stop curl buffering the output.
+
+Send the same request twice and the second comes back from cache. `-D -` shows which happened:
+
+```bash
+curl -s -o /dev/null -D - http://localhost:8000/v1/chat/completions \
+  -H 'Authorization: Bearer gw_live_YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}' | grep -i x-cache
+```
 
 Interactive docs are at `/docs`. Click **Authorize**, paste the key without the `Bearer` prefix,
 and the Try-it-out buttons will send it for you.
@@ -184,6 +199,69 @@ at `10:00:59` and another at `10:01:00`, so the true worst case is 2× the limit
 interval. A sliding window (a Redis sorted set of timestamps) or a token bucket removes this at the
 cost of more memory and more code. For a gateway, 2× tolerance is an acceptable price for an O(1),
 two-command check.
+
+## How caching works
+
+Identical requests are served from Redis rather than from the provider. The cache sits after
+authentication and rate limiting and immediately before the upstream call, so a hit never reaches
+OpenAI.
+
+Measured on a hosted Redis (Upstash, free tier):
+
+```
+2.790s   X-Cache: MISS    gateway -> OpenAI -> back
+0.218s   X-Cache: HIT     gateway -> Redis -> back
+```
+
+12.8x faster, and the hit costs nothing. Most of that 0.218s is network latency to Upstash rather
+than gateway overhead; a Redis on the same host answers in single-digit milliseconds.
+
+The cache key is a SHA-256 of the outgoing request body, prefixed with `cache:`. Hashing rather
+than storing the body directly keeps every key 64 characters whether the prompt is three words or
+a pasted document, which matters because Redis compares whole keys.
+
+**The key is built from the canonical form of the request.** `json.dumps` writes a dict's keys in
+whatever order it happens to have, so `{"model": ..., "stream": ...}` and
+`{"stream": ..., "model": ...}` are the same request with different bytes and therefore different
+hashes. `sort_keys=True` forces one ordering before hashing. Without it the cache never hits and
+never errors — it just quietly does nothing, which is the worst failure mode available. The hash is
+taken over the payload actually sent upstream, after optional fields are dropped, so it cannot
+drift from what the provider sees.
+
+**Exact match, not semantic.** Matching on meaning — embedding the prompt and serving any
+sufficiently similar stored answer — would raise the hit rate, and was left out on purpose. It
+costs an embedding call on every lookup including misses, and its similarity threshold is a guess:
+set it loosely and "how do I delete a user" is served the answer for "how do I create a user".
+Exact match has a 0% false-hit rate, which is the right default for a path that bills people.
+
+**One hour TTL.** Long enough that retries, repeated jobs and re-fetching frontends hit; short
+enough that nothing goes badly stale. Unbounded caching would also exhaust the 256MB free tier and
+start evicting the rate-limit counters sharing that Redis. The value and its expiry are set in a
+single Redis command rather than `SET` followed by `EXPIRE`, so a crash between the two cannot
+leave an entry that never expires.
+
+**The cache fails open; the rate limiter fails closed.** Both Redis calls here are wrapped so that
+a Redis failure logs and continues to the provider — a broken cache should cost money, never
+correctness. The rate limiter has no such fallback and returns an error instead. The asymmetry is
+deliberate: a dead cache means paying for completions that could have been skipped, while a dead
+limiter means unmetered traffic to paid providers. Different ceilings on the damage, different
+defaults.
+
+Two consequences worth stating. Errors are never cached, because the write sits below the check
+that returns early on an upstream failure — otherwise one transient `500` would become an hour of
+guaranteed failures. And a cache hit still consumes a rate-limit token, since the limit protects
+the gateway's own capacity, not only the provider bill.
+
+### Not yet covered
+
+**Streaming responses are not cached.** The stream is relayed without being read, and reading it to
+store a copy would consume the bytes the client is waiting for. Same underlying reason streamed
+requests are not billed.
+
+**Cache hits are not recorded in `usage_records`.** A hit costs nothing, so there is nothing to
+bill — but it also means the gateway's own data cannot answer how much the cache saved. Logging
+hits at zero cost would make "300 of 400 requests served free" reportable, which is the number that
+justifies the feature. Not built yet.
 
 ## How usage tracking works
 
@@ -270,6 +348,7 @@ app/
   auth.py                   API key verification, used as a FastAPI dependency
   security.py               key generation and hashing
   rate_limit.py             fixed-window counter and the enforcing dependency
+  cache.py                  request fingerprinting, cache read and write
   usage.py                  writes usage rows, aggregates them for the summary
   pricing.py                per-model rates and cost calculation
   db.py                     async engine, session factory, declarative base
@@ -285,10 +364,10 @@ scripts/
 
 ## Status
 
-Working: API key authentication, per-key rate limiting, usage and cost tracking, multi-provider
-routing, streaming, error mapping.
+Working: API key authentication, per-key rate limiting, response caching, usage and cost tracking,
+multi-provider routing, streaming, error mapping.
 
-Planned: response caching, retries and provider failover, tests and Docker.
+Planned: retries and provider failover, tests and Docker.
 
 Schema changes are applied with `scripts/init_db.py`, which only creates missing tables and never
 alters existing ones — the `rate_limit` column, the `timestamptz` conversions and the widening of
